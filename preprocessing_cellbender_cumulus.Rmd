@@ -1,0 +1,999 @@
+---
+title: "preprocessing_cellbender_cumulus"
+output: html_document
+---
+
+# Load libraries, set paths, etc. 
+```{r}
+
+# Load libraries
+rm(list = ls())
+library(reticulate)  # comment out either the 3 UGER or 3 LOCAL lines depending on your run environment.
+# # UGER machine
+use_python("/home/dchafamo/anaconda3/envs/scanalysis/bin/python", required = T)
+use_condaenv(condaenv = "/home/dchafamo/anaconda3/envs/scanalysis")
+# py_config()  # check that the expected python is loaded for scrublet
+
+library(ggplot2)
+library(cowplot)
+theme_set(theme_cowplot())
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(gplots)
+library(GSA)
+
+#Set directories
+proj.path <- "./"
+user.path <- "./"
+
+# Set date year_month_day to use in figure directory name and in names for saving Rda objects.
+date <- "02-01-2022_cellbender"  
+name.project <- "guteqtl_preprocessing"
+
+### Set up sample ID list 
+tmp <- read.csv(paste0(proj.path, "data/sampletracking_guteqtl_rerun.csv"))
+sampleid <- tmp$sampleid
+sampleid <- setdiff(sampleid, "SCRSP-10575")
+names(sampleid) <- sampleid
+
+### Read in cumulus results 
+prefix.cumulus <- paste0(proj.path, "data/cellbenderV2_cumulus/")
+h5ad.file <- Sys.glob(paste0(prefix.cumulus, "*.h5ad"))
+names(h5ad.file) <- sampleid
+
+# Save paths / create output directories.
+
+# Figures
+figures.dir <- paste0(proj.path, "results/", date, "/")
+figures.path <- sapply(sampleid, function(i) paste0(figures.dir, i, "_"), USE.NAMES = F) 
+figures.path.counts <- sapply(sampleid, function(i) paste0(figures.dir, i, "_"), USE.NAMES = F) 
+
+# Seurat objects 
+seuratobjs.dir <- paste0(proj.path, "src/Rdata/SeuratObjs/")
+seuratobjs.cumulus_to_Seurat.path <- sapply(sampleid, function(i) paste0(seuratobjs.dir, i, "_", date, "_cumulus_to_Seurat.Rda"), USE.NAMES = F) 
+Rda.singler.path <- sapply(sampleid, function(i) paste0(proj.path, "src/Rdata/", i, "_", date, "_singler.Rda"), USE.NAMES = F) 
+cluster.scores.prefix <- paste0(proj.path, "src/Rdata/clusterscores/", date, "_10x_", name.project, "_")
+cluster.scores.path <- paste(cluster.scores.prefix, sampleid, "_cluster_scores.Rds", sep = "") 
+names(cluster.scores.path) <- sampleid
+
+out.dir <- c(figures.dir, seuratobjs.dir, paste0(proj.path, "src/Rdata/clusterscores/"))
+sapply(out.dir, function(i) {if (!dir.exists(i)) {dir.create(i, recursive = T)} })
+
+# Load my functions.
+source(paste0(user.path, "code/color_orr.R"))
+source(paste0(user.path, "code/orr_seurat3utils_020520.R"))
+source(paste0(user.path, "code/orr_plotutils_020520.R"))
+source(paste0(user.path, "code/cporter_seurat_utils.R"))
+
+
+# set up colors 
+colors <- c("#0f1519", "#191970", "#0072DD", "#63abc7", "#a2eaec", "#44bec7", "#7bc043", "#54aa77", "#c4f49c", "#e4f1e7", 
+                    "#f2ce85",  "#ffc425", "#ff9535", "#EF2E00", "#fc6060", "#ee6c75", "#ef00a9", "#cc5c78", "#ddc1cc", "#a35cff", 
+                    "#464680", "#5e0094", "#e1eafb", "#656565", "#721e1e", "#004bff", "#9200e6", "#ff8307", "#1ac9a8", "#071d49")  
+
+# knitr settings for code chunks.
+knitr::opts_knit$set(root.dir = proj.path)  # set working directory for all chunks
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+
+  
+```
+
+## Read in h5ad files and convert them from anndata to Seurat objects; save progress 
+```{r anndata_seurat, eval = F}
+# NEED TO ACTIVATE PYTHON ENVIRONMENT 
+# Need at least version 0.7.1 of anndata.
+ad <- import("anndata", convert = FALSE)  # import python module anndata
+
+# source("https://raw.githubusercontent.com/klarman-cell-observatory/cumulus/master/workflows/cumulus/h5ad2seurat.R")
+source(paste0(user.path, "code/convert_h5ad_to_seurat_temporary.R"))
+for (i in seq(h5ad.file)) {
+  print(h5ad.file[[i]])
+  gcdata.h5ad <- ad$read_h5ad(h5ad.file[[i]])
+  print(gcdata.h5ad)
+  gcdata <- convert_h5ad_to_seurat(gcdata.h5ad)
+  # Assign identity based on Leiden labels.
+  Idents(gcdata) <- "leiden_labels"
+  saveRDS(gcdata, file = seuratobjs.cumulus_to_Seurat.path[i])
+  
+}
+
+```
+
+##  SingleR to help identify cell types 
+```{r SingleR, eval = T}
+library(SingleR)
+library(celldex)
+reference <- HumanPrimaryCellAtlasData()
+# reference <- MouseRNAseqData()
+# reference <- NovershternHematopoieticData()
+# reference <- DatabaseImmuneCellExpressionData()
+
+# Heatmap functions needed to save pheatmap and also to make grids of pheatmap plots
+library(pheatmap)
+library(gridExtra)
+library(grid)
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+  stopifnot(!missing(x))
+  stopifnot(!missing(filename))
+  pdf(filename, width=width, height=height)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+
+for (i in seq(sampleid)) {
+  gcdata <- readRDS(seuratobjs.cumulus_to_Seurat.path[i])
+  Idents(gcdata) <- "leiden_labels" # SHOULD DO THIS STEP EARLIER IN THIS SCRIPT
+  common <- intersect(rownames(reference), rownames(gcdata))
+  singler.cell.results <- SingleR(test = GetAssayData(gcdata, slot = "data")[common, ], ref = reference[common, ], labels = reference$label.main, method = "single")
+  
+  gcdata[["SingleR.cell.labels"]] <- singler.cell.results$labels
+  
+  p1 <- DimPlot(gcdata, reduction = "umap", group.by = "SingleR.cell.labels", cols = material.heat(n_distinct(gcdata$SingleR.cell.labels)), label = T) + NoLegend()
+  p3 <- DimPlot(gcdata, reduction = "umap", group.by = "leiden_labels", cols = material.heat(n_distinct(gcdata$leiden_labels)), label = T) + NoLegend()
+  
+  # code edits made to account for low cell count samples that have only 1 cluster 
+  if (length(unique(Idents(gcdata)))>1){
+    singler.cluster.results <- SingleR(test = GetAssayData(gcdata, slot = "data")[common, ], ref = reference[common, ], labels = reference$label.main, method = "cluster", clusters = Idents(gcdata))
+    gcdata[["SingleR.cluster.labels"]] <- plyr::mapvalues(gcdata[[]][["leiden_labels"]],
+                                                        from = rownames(singler.cluster.results),
+                                                        to = singler.cluster.results$labels)
+    p2 <- DimPlot(gcdata, reduction = "umap", group.by = "SingleR.cluster.labels", cols = material.heat(n_distinct(gcdata$SingleR.cluster.labels)), label = T) + NoLegend()
+  } else if (length(unique(Idents(gcdata)))==1){p2 <- p1}
+
+  plot_grid(p1, p2, p3, ncol = 2)
+  ggsave(paste0(figures.dir, "/", sampleid[i], "_SingleR_UMAP.pdf"), width = 12, height = 12)
+
+  p <- plotScoreHeatmap(singler.cell.results, show.labels = T)
+  save_pheatmap_pdf(p, paste0(figures.dir, "/", sampleid[i], "_SingleR_cell_score_heatmap.pdf"),
+                    width = 10, height = 6)
+  p <- plotScoreHeatmap(singler.cluster.results, show.labels = T)
+  save_pheatmap_pdf(p, paste0(figures.dir, "/", sampleid[i], "_SingleR_cluster_score_heatmap.pdf"),
+                    width = 10, height = 6)
+  saveRDS(gcdata, file = seuratobjs.cumulus_to_Seurat.path[i])
+}
+```
+
+## QC plots
+Plot all QCs together on a single plot, rather than individually per sample 
+```{r QC plotting, eval = T}
+
+cl <- colors(distinct = TRUE)
+set.seed(15887) # to set random generator seed
+colors <- sample(cl, 60)
+
+# Build data frame with QCs to plot from all samples 
+df <- data.frame()
+df.qc <- data.frame()
+df.genic <- data.frame()
+for (id in sampleid){
+  
+  gcdata <- readRDS(seuratobjs.cumulus_to_Seurat.path[id])
+  
+  df.tmp <- data.frame(nGene=gcdata@meta.data$nGene, nUMI=gcdata@meta.data$nUMI,
+                       mito=gcdata@meta.data$percent_mito, 
+                       doublet=gcdata@meta.data$doublet,
+                       Condition=gcdata@meta.data$Channel)
+  df <- rbind(df, df.tmp)
+  
+}
+
+
+df2 <- as.data.frame(table(df$Condition))
+colnames(df2) <- c("Condition", "nCell")
+
+# Violin plot of nGene
+violin.p1 <- ggplot(df, aes(x=Condition, y=nGene, fill=Condition)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="No. of genes/cell") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+              # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        geom_violin(scale="width", draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5) +
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Violin plot of nUMI
+violin.p2 <- ggplot(df, aes(x=Condition, y=nUMI, fill=Condition)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="No. of UMI/cell") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+              # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        geom_violin(scale="width", draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5) +
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Violin plot of mito
+violin.p3 <- ggplot(df, aes(x=Condition, y=mito, fill=Condition)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="Fraction mito. genes") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+        #       # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        # geom_violin(draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5, na.rm=TRUE) +
+        geom_violin(scale="width", data = df, draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5, na.rm=TRUE) + 
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Bar plots of number of detected cells
+col.plot1 <- ggplot(df2, aes(Condition, nCell)) +
+                geom_col(aes(fill=Condition), color="black") +
+                scale_fill_manual(values = colors) +
+                labs(x="", y="Total Cells") +
+                theme(strip.background = element_blank(),
+                      legend.position = "none",
+                      axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+                      axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+                      text=element_text(size=8, family="Helvetica"),
+                      axis.line.x = element_line(color = 'black', size = 0.25),
+                      axis.line.y = element_line(color = 'black', size = 0.25),
+                      axis.ticks.x = element_line(color = 'black', size = 0.25),
+                      axis.ticks.y = element_line(color = 'black', size = 0.25),
+                      axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+                      axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+                      aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+                      plot.background = element_blank(),
+                      plot.title = element_text(size=8, family="Helvetica"))
+
+
+h = 5
+w = 8
+all.p <- align_plots(violin.p1, violin.p2, violin.p3, col.plot1, align="hv", axis="tblr")
+save_plot(paste0(figures.dir, "/QC_nGene_", date, ".pdf"), ggdraw(all.p[[1]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_nUMI_", date, ".pdf"), ggdraw(all.p[[2]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_mito_", date, ".pdf"), ggdraw(all.p[[3]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_nCell_", date, ".pdf"), ggdraw(all.p[[4]]), base_height = h, base_width = w)
+
+# make a summary table of all stats
+nGene_med <- df %>% group_by(Condition) %>% summarise(nGene_med=median(c(nGene)))
+nUMI_med <- df %>% group_by(Condition) %>% summarise(nUMI_med=median(c(nUMI)))
+mito_med <- df %>% group_by(Condition) %>% summarise(mito_med=median(c(mito)))
+
+qc.summary.table <- merge(df2, nGene_med)
+qc.summary.table <- merge(qc.summary.table, nUMI_med)
+qc.summary.table <- merge(qc.summary.table, mito_med)
+
+write.table(qc.summary.table, paste0(figures.dir, "/QC_", date, "_summaryQCs.csv"),
+          col.names=TRUE, row.names=FALSE, sep=",")
+
+```
+
+Annotation signatures on UMAP 
+```{r annotation_signatures, eval = T}
+
+# Read in list of gene sets associated with different cell types.
+file.gmt.htapp <- paste0(user.path, "code/gene_signatures/htapp_sigs.gmt")
+invisible(capture.output(gs.htapp <- GSA.read.gmt(file.gmt.htapp)))
+
+# We want to determine what cell type each cell cluster corresponds to. We will read in sets of genes known to be associated with a certain cell type or cell state and score each cell by that set of genes. We can then take the average score for that gene set for all cells within the cluster.
+name.cluster <- "leiden_labels"
+gs <- gs.htapp
+
+# Iterate over each Seurat object and score each cluster with gene signatures.
+dir.create(paste0(figures.dir, "/UMAP_scores/"))
+
+for (s in sampleid[19:length(sampleid)]) {
+
+  # load in Seurat object
+  # gcdata <- readRDS(seuratobjs.Seurat_annotate.path[s])
+  gcdata <- readRDS(seuratobjs.cumulus_to_Seurat.path[s])
+
+  out.prefix <- paste0(figures.dir, "/UMAP_scores/", s, "/")
+  cluster.scores <- RankModuleScore(gcdata, name.cluster, gs, out.prefix)
+  # For each cluster, rank the gene modules by their mean score for that cluster.
+  if (ncol(cluster.scores)>1){
+    for (i in seq(cluster.scores[, name.cluster])) {
+     # Order gene modules in descending order, and ignore the first column which is the cluster number
+     top.clusters <- names(cluster.scores)[order(-cluster.scores[i, -c(1)]) + 1]
+     test.df <- cbind(data.frame(cluster = cluster.scores[i, name.cluster]), cluster.scores[i, top.clusters[1:3]])
+     print(test.df)
+    }
+    saveRDS(cluster.scores, file=cluster.scores.path[s])
+  }
+
+}
+
+```
+
+## Plot clusters on their own figure for each sample 
+```{r plot_clusters, eval = T}
+
+for (id in sampleid){
+
+  gcdata <- readRDS(seuratobjs.cumulus_to_Seurat.path[id])
+  n.clusters <- max(as.numeric(gcdata@meta.data$leiden_labels))
+  df <- data.frame(gcdata@reductions$umap@cell.embeddings, cluster = gcdata@meta.data$leiden_labels)
+  p1 <- ggplot(data = df) +
+          geom_point(mapping = aes(UMAP_1, UMAP_2, color = cluster), size = 0.5, shape=19) +
+          labs(color = "leiden_cluster", title=sampleid[[id]]) +
+          scale_colour_manual(values =colors) +
+          guides(colour = guide_legend(override.aes = list(size=5))) +
+          theme(axis.text = element_text(size=8, family="Helvetica"),
+                legend.position = "right",
+                legend.text = element_text(size=8, family="Helvetica"),
+                legend.margin=margin(0,0,0,0),
+                legend.box.margin=margin(-10,0,-10,-10),
+                legend.title = element_text(size=8, family="Helvetica"),
+                legend.key.size = unit(.1, "cm"),
+                axis.line.x = element_line(color = 'black', size = 0.75),
+                axis.line.y = element_line(color = 'black', size = 0.75),
+                axis.ticks.x = element_line(color = 'black', size = 0.75),
+                axis.ticks.y = element_line(color = 'black', size = 0.75),
+                axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 1, 0, 0)),
+                axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+                aspect.ratio = 1, plot.margin = unit(c(.1, .3, .1, .1), "cm"),
+                plot.background = element_blank(),
+                plot.title = element_text(size=8, family="Helvetica")) +
+          guides(color = guide_legend(override.aes = list(size=2)))
+  save_plot(paste0(figures.path[id], "clusters.pdf"), p1, base_height = 3.5, base_width = 3.5)
+}
+
+```
+
+## Pool individual Seurat objects into a single Seurat object 
+```{r pool_samples, eval = T}
+library(rlist)
+
+all.objects <- list()
+for (i in names(seuratobjs.cumulus_to_Seurat.path)){ 
+  gcdata <- readRDS(seuratobjs.cumulus_to_Seurat.path[[i]])
+  all.objects <- list.append(all.objects, gcdata)
+}
+
+################################
+# merge samples 
+# library(Seurat)
+gcdata.merge <- merge(x=all.objects[1][[1]], y=all.objects[-1], project="guteqtl_merged")
+save(gcdata.merge, file=paste0(seuratobjs.dir,"pooled_", date, "not_analyzed_SeuratObjs.Rda"))
+
+```
+
+## Get Chris Smillie colon marker genes and make gmt files
+```{r, eval = F}
+library(readxl)
+
+file.marker <- paste0(user.path, "code/gene_signatures/mmc2.xlsx")
+
+epithelial <- read_excel(file.marker, sheet = "Epithelial")
+stromal <- read_excel(file.marker, sheet = "Stromal")
+immune <- read_excel(file.marker, sheet = "Immune")
+subclusters <- read_excel(file.marker, sheet = "Subclusters")
+
+
+lines <- c()
+epi.types <- unique(epithelial$ident)
+epi.types <- gsub(" ", "_", epi.types)
+for (t in epi.types){
+  genes <- epithelial$gene[epithelial$ident==t]
+  line <- paste0(t, "\t", t, "\t", paste0(genes, collapse = "\t"))
+  lines <- c(lines, line)
+}
+
+stromal.types <- unique(stromal$ident)
+stromal.types <- gsub(" ", "_", stromal.types)
+for (t in stromal.types){
+  genes <- stromal$gene[stromal$ident==t]
+  line <- paste0(t, "\t", t, "\t", paste0(genes, collapse = "\t"))
+  lines <- c(lines, line)
+}
+
+immune.types <- unique(immune$ident)
+immune.types <- gsub(" ", "_", immune.types)
+for (t in immune.types){
+  genes <- immune$gene[immune$ident==t]
+  line <- paste0(t, "\t", t, "\t", paste0(genes, collapse = "\t"))
+  lines <- c(lines, line)
+}
+
+subclusters.types <- unique(subclusters$ident)
+subclusters.types <- gsub(" ", "_", subclusters.types)
+for (t in subclusters.types){
+  genes <- subclusters$gene[subclusters$ident==t]
+  line <- paste0(t, "\t", t, "\t", paste0(genes, collapse = "\t"))
+  lines <- c(lines, line)
+}
+
+fileConn <- file(paste0(user.path, "code/gene_signatures/2019_ChrisSmillie_colon_cell_types_Cell_S2.gmt"))
+writeLines(lines, fileConn)
+close(fileConn)
+```
+
+Analyze pooled samples across all cohorts using the base Seurat variable gene method (not scaled by mouse) 
+```{r analyze_pooled_samples_all, eval=T}
+load(paste0(seuratobjs.dir,"pooled_", date, "not_analyzed_SeuratObjs.Rda"))
+gcdata = gcdata.merge
+
+# # Identify variable genes without accounting for batch across sample 
+# gcdata <- FindVariableFeatures(gcdata, nfeatures = 2000, verbose=TRUE, selection.method="vst")
+#  
+# # Print length of variable genes 
+# print(length(VariableFeatures(gcdata)))
+# 
+# # Scale data without accounting for sample batch 
+# gcdata <- ScaleData(gcdata, features=VariableFeatures(gcdata), do.center=T, do.scale=F)
+# 
+# # Do PCA using variable genes or using all genes (pc.genes = rownames(object@data))
+# gcdata <- RunPCA(gcdata, features = VariableFeatures(gcdata), npcs = 40)
+#   
+# ElbowPlot(gcdata, ndims=40)
+# ggsave(paste0(figures.dir, "/pooled_seuratBaseVarGenes_screeplot_all.png"), width = 6, height = 6)
+#   
+# # PC visualizations.
+# DimPlot(gcdata, dims = c(1, 2), reduction = "pca")
+# ggsave(paste0(figures.dir, "/pooled_seuratBaseVarGenes_PCA_all.png"), width = 6, height = 6)
+# VizDimLoadings(gcdata, dims = 1:6, reduction = "pca")
+# ggsave(paste0(figures.dir, "/pooled_seuratBaseVarGenes_PCA_loadings_all.png"), width = 8, height = 14)
+# DimHeatmap(gcdata, dims = 1:12, cells = 200, balanced = TRUE, fast = FALSE)
+# ggsave(paste0(figures.dir, "/pooled_seuratBaseVarGenes_PCA_heatmap_all.png"), width = 10, height = 16)
+#   
+# # Generate UMAP coordinates 
+# gcdata <- RunUMAP(gcdata, method = "umap-learn", 
+#                   min_dist=0.5, spread=1, metric="euclidean", n.neighbors=15, dims = 1:30)
+#   
+# # Find neighbors and clusters 
+# gcdata <- FindNeighbors(gcdata, reduction = "pca", dims = 1:30, k.param = 20)
+# for (i in seq(0.1, 0.5, by=0.1)) {gcdata <- FindClusters(gcdata, 
+#                                                           resolution = i, algorithm = 1, random.seed = 100)}
+# 
+# # Plot the clusters 
+# colors <- colors.clusters
+# for (i in seq(0.1, 0.5, by=0.1)) {
+#   index <- grep(paste0("RNA_snn_res.", i), colnames(gcdata@meta.data))
+#   df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data[,index])
+#   PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_seuratBaseVarGenes_seuratClusters_res", i, "_UMAP_all.png"),
+#                title=paste("RNA_snn_res.", i))
+# }
+# 
+# save(gcdata, file=paste0(seuratobjs.dir,"/pooled_", date, "_analyzed_seuratBaseVarGenes_SeuratObjs_all.Rda"))
+# load(paste0(seuratobjs.dir,"/pooled_", date, "_analyzed_seuratBaseVarGenes_SeuratObjs_all.Rda"))
+# 
+# # Plot UMAP colored by doublet 
+# df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data$pred_dbl)
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+# colors = sample(color, length(unique(df$metadata)))
+# PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_seuratBaseVarGenes_doublet_UMAP_all.pdf"), pt.size=0.01, title="doublet")
+# 
+# # Plot UMAP colored by sample 
+# df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data$Channel)
+# color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+# colors = sample(color, length(unique(df$metadata)))
+# PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_seuratBaseVarGenes_sample_UMAP_all.pdf"), pt.size=0.01, title="sample")
+# 
+# 
+# # gene signature scores 
+# # Read in list of gene sets associated with different cell types.
+# file.gmt.htapp <- paste0(user.path, "/code/gene_signatures/htapp_sigs.gmt")
+# invisible(capture.output(gs.htapp <- GSA.read.gmt(file.gmt.htapp)))
+# 
+# # We want to determine what cell type each cell cluster corresponds to. We will read in sets of genes known to be associated with a certain cell type or cell state and score each cell by that set of genes. We can then take the average score for that gene set for all cells within the cluster.
+# name.cluster <- "leiden_labels"
+# gs <- gs.htapp
+# 
+# # Iterate over each Seurat object and score each cluster with gene signatures.
+# dir.create(paste0(figures.dir, "/pooled_UMAP_scores/"))
+# 
+# out.prefix <- paste0(figures.dir, "/pooled_UMAP_scores/")
+# cluster.scores <- RankModuleScore(gcdata, name.cluster, gs, out.prefix)
+# # For each cluster, rank the gene modules by their mean score for that cluster.
+# if (ncol(cluster.scores)>1){
+#   for (i in seq(cluster.scores[, name.cluster])) {
+#    # Order gene modules in descending order, and ignore the first column which is the cluster number
+#    top.clusters <- names(cluster.scores)[order(-cluster.scores[i, -c(1)]) + 1]
+#    test.df <- cbind(data.frame(cluster = cluster.scores[i, name.cluster]), cluster.scores[i, top.clusters[1:3]])
+#    print(test.df)
+#   }
+#   saveRDS(cluster.scores, paste0(proj.path, "/src/Rdata/clusterscores/11-29-2021_cellbender_10x_guteqtl_preprocessing_pooledSamples_cluster_scores.Rds"))
+# }
+
+################ Remove doublets and repeat the above pooled analysis steps 
+gcdata <- subset(gcdata, cells=rownames(gcdata@meta.data)[gcdata@meta.data$pred_dbl==FALSE])
+
+gcdata <- FindVariableFeatures(gcdata, nfeatures = 2000, verbose=TRUE, selection.method="vst")
+ 
+# Print length of variable genes 
+print(length(VariableFeatures(gcdata)))
+
+# Scale data without accounting for sample batch 
+gcdata <- ScaleData(gcdata, features=VariableFeatures(gcdata), do.center=T, do.scale=F)
+
+# Do PCA using variable genes or using all genes (pc.genes = rownames(object@data))
+gcdata <- RunPCA(gcdata, features = VariableFeatures(gcdata), npcs = 40)
+  
+ElbowPlot(gcdata, ndims=40)
+ggsave(paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_screeplot_all.png"), width = 6, height = 6)
+  
+# PC visualizations.
+DimPlot(gcdata, dims = c(1, 2), reduction = "pca")
+ggsave(paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_PCA_all.png"), width = 6, height = 6)
+VizDimLoadings(gcdata, dims = 1:6, reduction = "pca")
+ggsave(paste0(figures.dir, "/pooled_seuratBaseVarGenes_PCA_loadings_all.png"), width = 8, height = 14)
+DimHeatmap(gcdata, dims = 1:12, cells = 200, balanced = TRUE, fast = FALSE)
+ggsave(paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_PCA_heatmap_all.png"), width = 10, height = 16)
+  
+# Generate UMAP coordinates 
+gcdata <- RunUMAP(gcdata, method = "umap-learn", 
+                  min_dist=0.5, spread=1, metric="euclidean", n.neighbors=15, dims = 1:30)
+  
+# Find neighbors and clusters 
+gcdata <- FindNeighbors(gcdata, reduction = "pca", dims = 1:30, k.param = 20)
+for (i in seq(0.1, 0.5, by=0.1)) {gcdata <- FindClusters(gcdata, 
+                                                          resolution = i, algorithm = 1, random.seed = 100)}
+
+# Plot the clusters 
+for (i in seq(0.1, 0.5, by=0.1)) {
+  index <- grep(paste0("RNA_snn_res.", i), colnames(gcdata@meta.data))
+  df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data[,index])
+  PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_seuratClusters_res", i, "_UMAP_all.png"),
+               title=paste("RNA_snn_res.", i))
+}
+
+save(gcdata, file=paste0(seuratobjs.dir,"/pooled_noDoublet_", date, "_analyzed_seuratBaseVarGenes_SeuratObjs_all.Rda"))
+# load(paste0(seuratobjs.dir,"/pooled_noDoublet_", date, "_analyzed_seuratBaseVarGenes_SeuratObjs_all.Rda"))
+
+# Plot UMAP colored by doublet 
+df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data$pred_dbl)
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+colors = sample(color, length(unique(df$metadata)))
+PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_doublet_UMAP_all.pdf"), pt.size=0.01, title="doublet")
+
+# Plot UMAP colored by sample 
+df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data$Channel)
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+colors = sample(color, length(unique(df$metadata)))
+PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_sample_UMAP_all.pdf"), pt.size=0.01, title="sample")
+
+# gene signature scores 
+# Read in list of gene sets associated with different cell types.
+file.gmt.htapp <- paste0(user.path, "code/gene_signatures/htapp_sigs.gmt")
+invisible(capture.output(gs.htapp <- GSA.read.gmt(file.gmt.htapp)))
+
+# We want to determine what cell type each cell cluster corresponds to. We will read in sets of genes known to be associated with a certain cell type or cell state and score each cell by that set of genes. We can then take the average score for that gene set for all cells within the cluster.
+name.cluster <- "leiden_labels"
+gs <- gs.htapp
+
+# Iterate over each Seurat object and score each cluster with gene signatures.
+dir.create(paste0(figures.dir, "/pooled_noDoublet_UMAP_scores/"))
+
+out.prefix <- paste0(figures.dir, "/pooled_noDoublet_UMAP_scores/")
+cluster.scores <- RankModuleScore(gcdata, name.cluster, gs, out.prefix)
+# For each cluster, rank the gene modules by their mean score for that cluster.
+if (ncol(cluster.scores)>1){
+  for (i in seq(cluster.scores[, name.cluster])) {
+   # Order gene modules in descending order, and ignore the first column which is the cluster number
+   top.clusters <- names(cluster.scores)[order(-cluster.scores[i, -c(1)]) + 1]
+   test.df <- cbind(data.frame(cluster = cluster.scores[i, name.cluster]), cluster.scores[i, top.clusters[1:3]])
+   print(test.df)
+  }
+  saveRDS(cluster.scores, paste0(proj.path, "src/Rdata/clusterscores/", date,
+                                 "_cellbender_10x_guteqtl_preprocessing_pooledSamples_noDoublet_cluster_scores.Rds"))
+}
+
+
+# REPEAT GENE SIGNATURES USING CHRIS SMILLIE'S COLON MARKER GENES 
+load(paste0(seuratobjs.dir,"/pooled_noDoublet_", date, "_analyzed_seuratBaseVarGenes_SeuratObjs_all.Rda"))
+# gene signature scores 
+# Read in list of gene sets associated with different cell types.
+file.gmt.smillie <- paste0(proj.path, "code/2019_ChrisSmillie_colon_cell_types_Cell_S2.gmt")
+invisible(capture.output(gs.smillie <- GSA.read.gmt(file.gmt.smillie)))
+
+# We want to determine what cell type each cell cluster corresponds to. We will read in sets of genes known to be associated with a certain cell type or cell state and score each cell by that set of genes. We can then take the average score for that gene set for all cells within the cluster.
+name.cluster <- "leiden_labels"
+gs <- gs.smillie
+
+# Iterate over each Seurat object and score each cluster with gene signatures.
+dir.create(paste0(figures.dir, "/pooled_noDoublet_UMAP_scores_Smillie_v2/"))
+
+out.prefix <- paste0(figures.dir, "/pooled_noDoublet_UMAP_scores_Smillie_v2/")
+cluster.scores <- RankModuleScore(gcdata, name.cluster, gs, out.prefix)
+# For each cluster, rank the gene modules by their mean score for that cluster.
+if (ncol(cluster.scores)>1){
+  for (i in seq(cluster.scores[, name.cluster])) {
+   # Order gene modules in descending order, and ignore the first column which is the cluster number
+   top.clusters <- names(cluster.scores)[order(-cluster.scores[i, -c(1)]) + 1]
+   test.df <- cbind(data.frame(cluster = cluster.scores[i, name.cluster]), cluster.scores[i, top.clusters[1:3]])
+   print(test.df)
+  }
+  saveRDS(cluster.scores, paste0(proj.path, "/src/Rdata/clusterscores/", date,
+                              "_cellbender_10x_guteqtl_preprocessing_pooledSamples_noDoublet_cluster_scores_Smillie.Rds"))
+}
+
+# Check T cell markers
+fp <- FeaturePlot(gcdata, c("CD3G", "CD3E", "CD3D"), cols = c("gray", "red"), ncol=3)
+ggsave(paste0(figures.dir, "/pooled_noDoublet_seuratCommonVarGenes_Tcell_markers_featurePlot.png"), height=6, width=20)
+
+# Check percentage of CD3 expressing cells 
+cd3g <- colnames(gcdata)[GetAssayData(gcdata)[grep("^CD3G$", rownames(gcdata)),]>0]
+cd3e <- colnames(gcdata)[GetAssayData(gcdata)[grep("^CD3E$", rownames(gcdata)),]>0]
+cd3d <- colnames(gcdata)[GetAssayData(gcdata)[grep("^CD3D$", rownames(gcdata)),]>0]
+
+length(cd3g)
+length(cd3e)
+length(cd3d)
+
+cd3 <- union(union(cd3g, cd3e),cd3d)
+length(cd3)
+
+######## Plot UMAP colored by final clustering resolution 
+
+df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data[,'RNA_snn_res.0.2'])
+PlotMetaData(df=df, file.plot=paste0(figures.dir, "/pooled_noDoublet_seuratBaseVarGenes_seuratClusters_res0.2_UMAP_all.png"),
+             title="Cluster", h=4, w=6)
+
+load(paste0(seuratobjs.dir,"/pooled_noDoublet_", date, "_analyzed_seuratBaseVarGenes_SeuratObjs_all.Rda"))
+
+### ANNOTATE THE POOLED UMAP 
+file.plot <- paste0(figures.dir, "/allSamples_", date, "_seuratBaseVarGenes_highLevelAnnotation.png")
+title <- "cell identity"
+current.cluster.ids <- seq(0,max(as.numeric(gcdata@meta.data$RNA_snn_res.0.2))-1)
+new.cluster.ids <- c(
+  "Epithelial",   #0.
+  "Epithelial",  #1.
+  "Epithelial",   #2.
+  "Epithelial",   #3.
+  "Epithelial",  #4.
+  "B",  #5.
+  "T",   #6.
+  "Epithelial",     #7.
+  "Epithelial", #8.
+  "Stromal", #9. 
+  "Epithelial", #10.
+  "Endothelial", #11.
+  "Myeloid", #12.
+  "Epithelial", #13.
+  "B", #14
+  "Tuft", #15., 
+  "Epithelial", #16.
+  "?")  #17.
+Idents(gcdata) <- paste0("RNA_snn_res.0.2")
+Idents(gcdata) <- plyr::mapvalues(x = Idents(gcdata), from = current.cluster.ids, to = new.cluster.ids)
+gcdata[["pooled_annotate"]] <- Idents(object = gcdata)
+
+colors = c("#191970", "#0072DD", "#7bc043","#ffc425", "#ff9535", "#EF2E00",  "#ef00a9", "#cc5c78", 
+                     "#a35cff", "#464680", "#721e1e", "#004bff", "#9200e6", "#ff8307", "#1ac9a8", "#071d49", 
+                     "#0f1519", "#63abc7", "#a2eaec", "#44bec7", "#54aa77", "#c4f49c", "#e4f1e7", "#f2ce85",
+                     "#fc6060", "#ee6c75", "#ddc1cc", "#5e0094", "#e1eafb", "#656565", "#FF5733", "#33FFBD", 
+                     "#34495E", "#BDB76B", "#FFF8DC", "#F4A460", "#48D1CC", "#ADFF2F", "#2F4F4F")
+df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data$pooled_annotate)
+PlotMetaData(df, file.plot, title, h=4, w=6, pt.size=0.1)
+
+save(gcdata, file=paste0(seuratobjs.dir, "pooled_noDoublet_", date, "_seuratBaseVarGenes_highLevelAnnotate_SeuratObjs_UMAP.Rda"))
+```
+
+QC plots by cluster
+```{r QC plotting by cluster, eval = T}
+load(paste0(seuratobjs.dir, "pooled_noDoublet_", date, "_seuratBaseVarGenes_highLevelAnnotate_SeuratObjs_UMAP.Rda"))
+
+colors = c("#191970", "#0072DD", "#7bc043","#ffc425", "#ff9535", "#EF2E00",  "#ef00a9", "#cc5c78", 
+                     "#a35cff", "#464680", "#721e1e", "#004bff", "#9200e6", "#ff8307", "#1ac9a8", "#071d49", 
+                     "#0f1519", "#63abc7", "#a2eaec", "#44bec7", "#54aa77", "#c4f49c", "#e4f1e7", "#f2ce85",
+                     "#fc6060", "#ee6c75", "#ddc1cc", "#5e0094", "#e1eafb", "#656565", "#FF5733", "#33FFBD", 
+                     "#34495E", "#BDB76B", "#FFF8DC", "#F4A460", "#48D1CC", "#ADFF2F", "#2F4F4F")
+
+# Build data frame with QCs to plot from all samples 
+
+df <- data.frame(nGene=gcdata@meta.data$nGene, nUMI=gcdata@meta.data$nUMI,
+                 mito=gcdata@meta.data$percent_mito, 
+                 doublet=gcdata@meta.data$doublet,
+                 Condition=gcdata@meta.data$Channel, 
+                 cluster=gcdata@meta.data$RNA_snn_res.0.2, 
+                 celltype=gcdata@meta.data$pooled_annotate)
+
+
+df2 <- as.data.frame(table(df$cluster))
+colnames(df2) <- c("cluster", "nCell")
+
+# Violin plot of nGene
+violin.p1 <- ggplot(df, aes(x=cluster, y=nGene, fill=cluster)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="No. of genes/cell") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+              # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        geom_violin(scale="width", draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5) +
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Violin plot of nUMI
+violin.p2 <- ggplot(df, aes(x=cluster, y=nUMI, fill=cluster)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="No. of UMI/cell") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+              # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        geom_violin(scale="width", draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5) +
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Violin plot of mito
+violin.p3 <- ggplot(df, aes(x=cluster, y=mito, fill=cluster)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="Fraction mito. genes") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+        #       # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        # geom_violin(draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5, na.rm=TRUE) +
+        geom_violin(scale="width", data = df, draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5, na.rm=TRUE) + 
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Bar plots of number of detected cells
+col.plot1 <- ggplot(df2, aes(cluster, nCell)) +
+                geom_col(aes(fill=cluster), color="black") +
+                scale_fill_manual(values = colors) +
+                labs(x="", y="Total Cells") +
+                theme(strip.background = element_blank(),
+                      legend.position = "none",
+                      axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+                      axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+                      text=element_text(size=8, family="Helvetica"),
+                      axis.line.x = element_line(color = 'black', size = 0.25),
+                      axis.line.y = element_line(color = 'black', size = 0.25),
+                      axis.ticks.x = element_line(color = 'black', size = 0.25),
+                      axis.ticks.y = element_line(color = 'black', size = 0.25),
+                      axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+                      axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+                      aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+                      plot.background = element_blank(),
+                      plot.title = element_text(size=8, family="Helvetica"))
+
+
+h = 5
+w = 8
+all.p <- align_plots(violin.p1, violin.p2, violin.p3, col.plot1, align="hv", axis="tblr")
+save_plot(paste0(figures.dir, "/QC_nGene_", date, "_byCluster.pdf"), ggdraw(all.p[[1]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_nUMI_", date, "_byCluster.pdf"), ggdraw(all.p[[2]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_mito_", date, "_byCluster.pdf"), ggdraw(all.p[[3]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_nCell_", date, "_byCluster.pdf"), ggdraw(all.p[[4]]), base_height = h, base_width = w)
+
+# make a summary table of all stats
+nGene_med <- df %>% group_by(cluster) %>% summarise(nGene_med=median(c(nGene)))
+nUMI_med <- df %>% group_by(cluster) %>% summarise(nUMI_med=median(c(nUMI)))
+mito_med <- df %>% group_by(cluster) %>% summarise(mito_med=median(c(mito)))
+
+qc.summary.table <- merge(df2, nGene_med)
+qc.summary.table <- merge(qc.summary.table, nUMI_med)
+qc.summary.table <- merge(qc.summary.table, mito_med)
+
+write.table(qc.summary.table, paste0(figures.dir, "/QC_", date, "_summaryQCs_byCluster.csv"),
+          col.names=TRUE, row.names=FALSE, sep=",")
+
+## REPEAT BY CELL TYPE
+
+df2 <- as.data.frame(table(df$celltype))
+colnames(df2) <- c("celltype", "nCell")
+
+# Violin plot of nGene
+violin.p1 <- ggplot(df, aes(x=celltype, y=nGene, fill=celltype)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="No. of genes/cell") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+              # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        geom_violin(scale="width", draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5) +
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Violin plot of nUMI
+violin.p2 <- ggplot(df, aes(x=celltype, y=nUMI, fill=celltype)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="No. of UMI/cell") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+              # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        geom_violin(scale="width", draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5) +
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Violin plot of mito
+violin.p3 <- ggplot(df, aes(x=celltype, y=mito, fill=celltype)) +
+        geom_violin(scale="width") +
+        scale_fill_manual(values = colors) +
+        labs(x="", y="Fraction mito. genes") +
+        theme(strip.background = element_blank(),
+              legend.position = "none",
+              axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+              axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+              text=element_text(size=8, family="Helvetica"),
+              axis.line.x = element_line(color = 'black', size = 0.25),
+              axis.line.y = element_line(color = 'black', size = 0.25),
+              axis.ticks.x = element_line(color = 'black', size = 0.25),
+              axis.ticks.y = element_line(color = 'black', size = 0.25),
+              axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+              axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+              aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+              plot.background = element_blank(),
+              plot.title = element_text(size=8, family="Helvetica")) +
+        #       # panel.background = element_rect(color="black", size = 0.75, linetype = "solid"),
+        # geom_violin(draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5, na.rm=TRUE) +
+        geom_violin(scale="width", data = df, draw_quantiles = c(0.25, 0.75), fill="transparent", color="black", size=0.5, na.rm=TRUE) + 
+        stat_summary(fun.y="median", geom="point", color="black", fill="white", size=1.3, shape=21)
+
+
+# Bar plots of number of detected cells
+col.plot1 <- ggplot(df2, aes(celltype, nCell)) +
+                geom_col(aes(fill=celltype), color="black") +
+                scale_fill_manual(values = colors) +
+                labs(x="", y="Total Cells") +
+                theme(strip.background = element_blank(),
+                      legend.position = "none",
+                      axis.text.x=element_text(size=8, family="Helvetica", angle=90, hjust=1, vjust=0.5),
+                      axis.text.y=element_text(size=8, family="Helvetica", hjust=0.5),
+                      text=element_text(size=8, family="Helvetica"),
+                      axis.line.x = element_line(color = 'black', size = 0.25),
+                      axis.line.y = element_line(color = 'black', size = 0.25),
+                      axis.ticks.x = element_line(color = 'black', size = 0.25),
+                      axis.ticks.y = element_line(color = 'black', size = 0.25),
+                      axis.title.y = element_text(size=8, family="Helvetica", margin = margin(0, 2, 0, 0)),
+                      axis.title.x = element_text(size=8, family="Helvetica", margin = margin(1, 0, 0, 0)),
+                      aspect.ratio = 0.5, plot.margin = unit(c(.1, .1, .1, .1), "cm"),
+                      plot.background = element_blank(),
+                      plot.title = element_text(size=8, family="Helvetica"))
+
+
+h = 5
+w = 8
+all.p <- align_plots(violin.p1, violin.p2, violin.p3, col.plot1, align="hv", axis="tblr")
+save_plot(paste0(figures.dir, "/QC_nGene_", date, "_byCellType.pdf"), ggdraw(all.p[[1]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_nUMI_", date, "_byCellType.pdf"), ggdraw(all.p[[2]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_mito_", date, "_byCellType.pdf"), ggdraw(all.p[[3]]), base_height = h, base_width = w)
+save_plot(paste0(figures.dir, "/QC_nCell_", date, "_byCellType.pdf"), ggdraw(all.p[[4]]), base_height = h, base_width = w)
+
+# make a summary table of all stats
+nGene_med <- df %>% group_by(cluster) %>% summarise(nGene_med=median(c(nGene)))
+nUMI_med <- df %>% group_by(cluster) %>% summarise(nUMI_med=median(c(nUMI)))
+mito_med <- df %>% group_by(cluster) %>% summarise(mito_med=median(c(mito)))
+
+qc.summary.table <- merge(df2, nGene_med)
+qc.summary.table <- merge(qc.summary.table, nUMI_med)
+qc.summary.table <- merge(qc.summary.table, mito_med)
+
+write.table(qc.summary.table, paste0(figures.dir, "/QC_", date, "_summaryQCs_byCellType.csv"),
+          col.names=TRUE, row.names=FALSE, sep=",")
+
+# QC feature plots
+fp <- FeaturePlot(gcdata, c('nGene', 'nUMI', 'percent_mito'), cols = c("gray", "red"), ncol=3)
+ggsave(paste0(figures.dir, "/pooled_noDoublet_seuratCommonVarGenes_QCs_featurePlot.png"), height=6, width=20)
+
+
+```
+
+Plot pooled annotation assignment on individual UMAPs
+```{r individual_umap_annotations, eval = T}
+load(paste0(seuratobjs.dir, "pooled_noDoublet_", date, "_seuratBaseVarGenes_highLevelAnnotate_SeuratObjs_UMAP.Rda"))
+meta <- data.frame(pooled_annotate=gcdata@meta.data$pooled_annotate)
+rownames(meta) <- rownames(gcdata@meta.data)
+
+colors = c("#191970", "#0072DD", "#7bc043","#ffc425", "#ff9535", "#EF2E00",  "#ef00a9", "#cc5c78", 
+                     "#a35cff", "#464680", "#721e1e", "#004bff", "#9200e6", "#ff8307", "#1ac9a8", "#071d49", 
+                     "#0f1519", "#63abc7", "#a2eaec", "#44bec7", "#54aa77", "#c4f49c", "#e4f1e7", "#f2ce85",
+                     "#fc6060", "#ee6c75", "#ddc1cc", "#5e0094", "#e1eafb", "#656565", "#FF5733", "#33FFBD", 
+                     "#34495E", "#BDB76B", "#FFF8DC", "#F4A460", "#48D1CC", "#ADFF2F", "#2F4F4F")
+
+samps <- names(seuratobjs.cumulus_to_Seurat.path)
+for (i in samps){ 
+  gcdata <- readRDS(seuratobjs.cumulus_to_Seurat.path[[i]])
+  gcdata <- AddMetaData(gcdata, meta)
+  gcdata <- subset(gcdata, cells=rownames(gcdata@meta.data)[gcdata@meta.data$pred_dbl==FALSE])
+
+  file.plot <- paste0(figures.dir, "/allSamples_", date, "_seuratBaseVarGenes_highLevelAnnotation_", i, ".png")
+  df <- data.frame(gcdata@reductions$umap@cell.embeddings, metadata = gcdata@meta.data$pooled_annotate)
+  PlotMetaData(df, file.plot, i, h=4, w=6, pt.size=0.1)
+
+}
+
+# Bar plot of cell type by sample 
+load(paste0(seuratobjs.dir, "pooled_noDoublet_", date, "_seuratBaseVarGenes_highLevelAnnotate_SeuratObjs_UMAP.Rda"))
+
+cl <- colors(distinct = TRUE)
+set.seed(15887) # to set random generator seed
+colors <- sample(cl, 60)
+df <- data.frame(gcdata@reductions$umap@cell.embeddings, clusters = gcdata@meta.data$pooled_annotate, metadata = gcdata@meta.data$Channel)
+  PlotMetaDataBar(df, file.plot = paste0(figures.dir, "allSamples_seuratCommonVarGenes_annotation_sample.png"), title="annotation", h = 2, w = 8)
+```
